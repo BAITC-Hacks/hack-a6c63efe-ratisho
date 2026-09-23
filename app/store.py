@@ -233,6 +233,8 @@ class Store:
                 raise WorkflowError("Добавьте название перед публикацией.")
             if task.get('workflowVersion')==4 and (not task.get('qualification',{}).get('recommendations') or not task.get('requirementsConfirmed')):
                 raise WorkflowError('Завершите уточнения второго агента и согласуйте требования перед публикацией.',409)
+            if task.get('qualification',{}).get('cardSuggestions',{}).get('reviewed') is False:
+                raise WorkflowError('Просмотрите дополнения карточки из ответов: примените выбранные или оставьте карточку без изменений.',409)
             task["status"] = "published"
             self._changed(task)
             self._save_task(db, task)
@@ -524,12 +526,38 @@ class Store:
         if not all(clean.values()):raise WorkflowError('Заполните все ответы; можно написать «пока неизвестно».')
         return clean
 
-    def save_recommendations(self,task_id,revision,question_set_id,answers,result):
+    def save_recommendations(self,task_id,revision,question_set_id,answers,result,card_suggestions=None):
         with self.connection(write=True) as db:
             task=self._task(db,task_id);self._revision(task,revision)
             self.qualification_answers(task,{'questionSetId':question_set_id,'answers':answers})
             task['qualification'].update(answers=answers,recommendations=result)
+            task['qualification']['cardSuggestions']=card_suggestions or {'updates':[],'mode':'local','warning':'','reviewed':True}
             task['requirementsConfirmed']=False
             task['skillSuggestions']={'mode':result['mode'],'warning':result['warning'],'skills':[dict(s,weight=3 if category=='required' else 1,category=category) for key,category in (('requiredSkills','required'),('optionalSkills','optional')) for s in result[key]],'trace':[]}
             for skill in task.get('requiredSkills',[]):skill['confirmed']=False
+            self._changed(task);self._save_task(db,task);return task
+
+    def apply_answer_fields(self,task_id,payload):
+        from .brief_workflow import snapshot
+        if payload.get('confirmed') is not True:raise WorkflowError('Подтвердите проверку дополнений карточки.')
+        selected=payload.get('fields')
+        if not isinstance(selected,list) or any(not isinstance(k,str) for k in selected) or len(set(selected))!=len(selected):raise WorkflowError('Некорректный выбор полей.')
+        with self.connection(write=True) as db:
+            task=self._task(db,task_id);self._revision(task,payload.get('revision'))
+            q=task.get('qualification',{});suggestions=q.get('cardSuggestions',{})
+            if q.get('id')!=payload.get('questionSetId') or q.get('contextHash')!=snapshot(task) or suggestions.get('reviewed') is not False:
+                raise WorkflowError('Дополнения уже обработаны или устарели. Обновите карточку.',409)
+            rows={r['field']:r for r in suggestions.get('updates',[])}
+            if any(k not in rows for k in selected):raise WorkflowError('Выбрано неизвестное дополнение.')
+            for key in selected:
+                row=rows[key]
+                if task['fields'][key]!=row['before']:raise WorkflowError('Поле изменилось. Повторите подготовку дополнений.',409)
+                task['fields'][key]=row['value']
+            task['fields']=validate_fields(task['fields'])
+            task['confirmedFields']=list(dict.fromkeys(task['confirmedFields']+selected))
+            if selected:task.pop('briefAssessment',None)
+            task['briefFinished']=dict(task['fields'])
+            suggestions.update(reviewed=True,acceptedFields=selected,reviewedAt=now())
+            # The interview remains valid: only reviewed quotations from its own answers were added.
+            q['contextHash']=snapshot(task)
             self._changed(task);self._save_task(db,task);return task
