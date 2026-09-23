@@ -27,3 +27,23 @@ Proposal {id,taskId,teamId,idea,plan,timeline,prototypeUrl,status:'pending'|'sel
 `app/domain.py`: FIELD_LABELS dict, INDUSTRIES list; score_task(fields,confirmed_fields) -> score; validate_fields(fields) -> normalized dict or ValueError; valid_url(value)->bool; field_is_meaningful(value)->bool.
 `app/seed.py`: seed_data() -> {tasks:[Task],teams:[Team],proposals:[Proposal]}; >=5 each, 5 tasks are published cards, plus 5 draft descriptions as extra draft tasks allowed. Use fixed IDs task1..task5, draft1..draft5, t1..t5, p1..p5. Scores computed by backend, timestamps ISO strings.
 `app/agents.py`: AgentOrchestrator(); .mode property; .questions(draft,industry,fields=None) -> {questions,mode,warning,trace}; .compose(draft,industry,answers,fields=None) -> {fields,mode,warning,trace}. Fields always all 10; no fabricated facts. Local fallback explicitly mode='local'. Optional configured remote provider, bounded timeout, strict validation, same local fallback on failures. Trace short summaries of actual steps, never private chain-of-thought.
+
+## Дополнение v2
+
+Все записи задач используют `revision`; при конфликте сервер возвращает 409. Все POST/PATCH требуют JSON и проверки Origin. В демо роль передаётся заголовками `X-Role`, `X-Team-Id` — это не полноценная авторизация.
+
+| Метод / маршрут | Вход | Результат |
+|---|---|---|
+| POST `/api/tasks/:id/chat` | revision, message (до 4000), focus (опционально) | task с conversation, memory, ai |
+| POST `/api/tasks/:id/chat-compose` | revision | task, автоматически предложенные навыки |
+| POST `/api/tasks/:id/skills-suggest` | revision | task.skillSuggestions, требует согласования |
+| POST `/api/tasks/:id/skills` | revision, skills: [{name,weight}], workMode, deadline | task.requiredSkills: подтверждённые требования |
+| POST `/api/tasks/:id/review` | revision | замечания с цитатами и снимком полей |
+| POST `/api/tasks/:id/review-resolve` | revision, issueId, status | статус open / resolved / dismissed |
+| POST `/api/teams/:id/profile/import` | consent:true, github, linkedin, text | предварительный профиль; навыки ещё не изменены |
+| PATCH `/api/teams/:id/profile` | revision, name, skills, technologies, interests, acceptImport?, achievementIndexes?, clearImport? | обновлённый профиль |
+| POST `/api/demo/reset` | confirmed:true | новый учебный пример; удаляется только предыдущий practice:true |
+
+`GET /api/bootstrap` дополнительно отдаёт task.match для выбранного профиля и task.candidates бизнесу. Студенту не выдаётся сохранённая бизнес-переписка, память и review; предварительный импорт доступен только выбранному профилю. Подтверждённые профессиональные сведения показываются другим участникам. Черновики бизнеса остаются невидимыми студентам.
+
+Профиль поддерживает `revision` с исходным значением 1, согласованный импорт и достижения со ссылками. Для существующих баз новые JSON-поля необязательны; данные не сбрасываются. Структура таблиц остаётся прежней.
