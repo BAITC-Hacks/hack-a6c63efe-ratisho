@@ -1,0 +1,10 @@
+{
+  "name": "hackalem-mvp",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Optional JavaScript syntax check; the app runs with Python only.",
+  "scripts": {
+    "check": "node --check static/app.js"
+  }
+}
