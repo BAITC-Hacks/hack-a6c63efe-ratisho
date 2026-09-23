@@ -404,7 +404,7 @@ class Store:
                 lookup={s['id']:s for s in draft['sources']}
                 achievements=[{**draft['achievements'][i],'source':lookup[draft['achievements'][i]['sourceId']]['label'],
                     'url':lookup[draft['achievements'][i]['sourceId']]['url']} for i in indexes]
-                team['profile']={'achievements':achievements,'evidence':[e for e in draft['evidence'] if e['name'].casefold() in {x.casefold() for x in skills+technologies}],
+                team['profile']={'sources':[{k:v for k,v in source.items() if k!='text'} | {'text':' '.join(e['evidence'] for e in draft['evidence'] if e.get('sourceId')==source['id'])} for source in draft['sources']],'achievements':achievements,'evidence':[e for e in draft['evidence'] if e['name'].casefold() in {x.casefold() for x in skills+technologies}],
                                  'githubUrl':draft['githubUrl'],'linkedinUrl':draft['linkedinUrl'],'confirmedAt':now()}
                 team.pop('profilePreview',None)
             if payload.get('clearImport') is True: team.pop('profile',None); team.pop('profilePreview',None)

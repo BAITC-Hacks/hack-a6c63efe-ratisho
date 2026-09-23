@@ -62,9 +62,14 @@ def match(task, team):
             'confidence':'Самооценка участника и подтверждённые им публичные источники; не проверка квалификации.'}
 
 def decorate(data, role, team_id):
+    from .talent_agents import specialist, task_analysis, recommendation
+    for item in data['teams']:
+        item['specialistAnalysis'] = specialist(item)
     team = next((x for x in data['teams'] if x['id'] == team_id), data['teams'][0])
     for task in data['tasks']:
         task['match'] = match(task, team)
+        task['taskAnalysis'] = task_analysis(task)
+        task['match']['recommendation'] = recommendation(team['specialistAnalysis'],task['taskAnalysis'],task['match'])
         if role == 'business' and task.get('canEdit',True):
             task['candidates'] = sorted([{'teamId':t['id'], **match(task,t)} for t in data['teams']],
                                         key=lambda x: (-(x['score'] if x['score'] is not None else -1), x['teamId']))
