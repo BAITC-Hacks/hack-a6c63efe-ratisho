@@ -215,7 +215,7 @@ def make_server(host="127.0.0.1", port=8000, db_path=None, orchestrator=None):
                 elif action is None and self.command=='PATCH': saved=store.update_profile(team_id,data)
                 else: raise WorkflowError('Маршрут не найден.',404)
                 self._send(200,{'team':saved}); return
-            flow=re.fullmatch(r'/api/tasks/([A-Za-z0-9_-]+)/(brief-extract|brief-assess|company-research|brief-finish|qualification-answers)',path)
+            flow=re.fullmatch(r'/api/tasks/([A-Za-z0-9_-]+)/(brief-extract|brief-assess|company-research|brief-finish|qualification-answers|brief-apply-answers)',path)
             if flow and self.command=='POST':
                 self._require(role,'business')
                 task_id,action=flow.groups();task=store.assert_owner(task_id,self.user['id'])
@@ -236,9 +236,11 @@ def make_server(host="127.0.0.1", port=8000, db_path=None, orchestrator=None):
                     elif action=='brief-finish':
                         store.require_brief_finished(task,data.get('confirmed'))
                         saved=store.save_qualification(task_id,task['revision'],company.questions(task),snapshot(task))
+                    elif action=='brief-apply-answers':saved=store.apply_answer_fields(task_id,data)
                     else:
                         answers=store.qualification_answers(task,data)
-                        saved=store.save_recommendations(task_id,task['revision'],data.get('questionSetId'),answers,company.recommend(task,answers))
+                        suggestions=brief.suggest_updates(task,answers)
+                        saved=store.save_recommendations(task_id,task['revision'],data.get('questionSetId'),answers,company.recommend(task,answers),suggestions)
                 self._send(200,{'task':saved});return
             extra=re.fullmatch(r'/api/tasks/([A-Za-z0-9_-]+)/(chat|chat-compose|skills-suggest|skills|review|review-resolve)',path)
             if extra and self.command=='POST':
