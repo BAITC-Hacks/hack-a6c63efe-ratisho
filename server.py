@@ -92,12 +92,27 @@ def make_server(host="127.0.0.1", port=8000, db_path=None, orchestrator=None):
                 raise WorkflowError("Это действие доступно только в роли «%s»." % ("Бизнес" if expected == "business" else "Команда"), 403, "forbidden")
 
         def _origin(self):
-            # Demo roles are deliberately selectable. Block cross-origin browser writes.
+            expected_origin = (
+                os.environ.get("PUBLIC_ORIGIN")
+                or os.environ.get("RENDER_EXTERNAL_URL")
+                or "http://" + self.headers.get("Host", "")
+            ).rstrip("/")
+
             origin = self.headers.get("Origin")
-            if origin and origin != "http://" + self.headers.get("Host", ""):
-                raise WorkflowError("Запрос с другого сайта запрещён.", 403, "origin")
+
+            if origin and origin != expected_origin:
+                raise WorkflowError(
+                    "Запрос с другого сайта запрещён.",
+                    403,
+                    "origin",
+                )
+
             if self.headers.get("Sec-Fetch-Site") == "cross-site":
-                raise WorkflowError("Запрос с другого сайта запрещён.", 403, "origin")
+                raise WorkflowError(
+                    "Запрос с другого сайта запрещён.",
+                    403,
+                    "origin",
+                )
 
         def _dispatch(self):
             path = urlsplit(self.path).path
