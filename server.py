@@ -8,6 +8,7 @@ import re
 import sqlite3
 import sys
 import uuid
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
@@ -38,6 +39,9 @@ from app.matching import decorate, ALIASES
 from app.profiles import preview as import_profile
 from app.store import text_value
 from app.store import Store, WorkflowError
+from app.auth import Auth
+from app.assistant import Assistant, profile_summary
+from app.brief_workflow import BriefAgent, CompanyAgent, snapshot
 
 
 def make_server(host="127.0.0.1", port=8000, db_path=None, orchestrator=None):
@@ -45,8 +49,13 @@ def make_server(host="127.0.0.1", port=8000, db_path=None, orchestrator=None):
     agents = orchestrator or AgentOrchestrator()
     intelligence = ConversationAgent(getattr(agents,"provider",None))
 
+    auth=Auth(store)
+    assistant=Assistant(getattr(agents,"provider",None))
+    brief=BriefAgent(getattr(agents,'provider',None))
+    company=CompanyAgent(getattr(agents,'provider',None))
+
     class Handler(BaseHTTPRequestHandler):
-        server_version = "HackAlem/1.0"
+        server_version = "HackAlem/4.0"
 
         def log_message(self, fmt, *args):
             # Access metadata only; never print submitted briefs, answers or credentials.
@@ -61,7 +70,8 @@ def make_server(host="127.0.0.1", port=8000, db_path=None, orchestrator=None):
             self.send_header("Cache-Control", "no-store" if content_type.startswith("application/json") else "no-cache")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("Referrer-Policy", "same-origin")
-            self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'")
+            self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob: data:; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'")
+            if getattr(self,"session_cookie",None):self.send_header("Set-Cookie",self.session_cookie)
             self.end_headers()
             if self.command != "HEAD":
                 self.wfile.write(content)
@@ -73,7 +83,8 @@ def make_server(host="127.0.0.1", port=8000, db_path=None, orchestrator=None):
                 length = int(self.headers.get("Content-Length", "0"))
             except ValueError:
                 raise WorkflowError("Некорректная длина запроса.", 400, "invalid_json")
-            if length <= 0 or length > 200000:
+            limit=12000000 if urlsplit(self.path).path=="/api/assistant" else 200000
+            if length <= 0 or length > limit:
                 raise WorkflowError("Запрос пустой или слишком большой.", 413, "body_size")
             try:
                 data = json.loads(self.rfile.read(length).decode("utf-8"))
@@ -84,13 +95,13 @@ def make_server(host="127.0.0.1", port=8000, db_path=None, orchestrator=None):
             return data
 
         def _identity(self):
-            role = self.headers.get("X-Role", "business")
-            if role not in ("business", "student"):
-                raise WorkflowError("Неизвестная роль.", 403, "forbidden")
-            team_id = self.headers.get("X-Team-Id", "t1")
-            if role == "student":
-                store.require_team(team_id)
-            return role, team_id
+            self.user=auth.current(self.headers.get('Cookie'))
+            if not self.user:raise WorkflowError('Войдите в демо-аккаунт.',401,'unauthorized')
+            return self.user['role'],self.user.get('teamId')
+
+        def _cookie(self,token,expire=False):
+            secure='; Secure' if (os.environ.get('PUBLIC_ORIGIN','').startswith('https://') or self.headers.get('X-Forwarded-Proto')=='https') else ''
+            self.session_cookie='hackalem_session='+token+'; Path=/; HttpOnly; SameSite=Lax; Max-Age='+('0' if expire else '86400')+secure
 
         @staticmethod
         def _require(role, expected):
@@ -98,7 +109,7 @@ def make_server(host="127.0.0.1", port=8000, db_path=None, orchestrator=None):
                 raise WorkflowError("Это действие доступно только в роли «%s»." % ("Бизнес" if expected == "business" else "Команда"), 403, "forbidden")
 
         def _origin(self):
-            # Demo roles are deliberately selectable. Block cross-origin browser writes.
+            # Reject cross-origin session mutations.
             origin = self.headers.get("Origin")
             expected = (os.environ.get('PUBLIC_ORIGIN') or os.environ.get('RENDER_EXTERNAL_URL') or
                         ('https://'+os.environ['RAILWAY_PUBLIC_DOMAIN'] if os.environ.get('RAILWAY_PUBLIC_DOMAIN') else None) or
@@ -123,26 +134,75 @@ def make_server(host="127.0.0.1", port=8000, db_path=None, orchestrator=None):
                 self._send(200, file.read_bytes(), content_type)
                 return
             if self.command == "GET" and path == "/api/health":
-                self._send(200, {"ok": True, "aiMode": agents.mode})
+                self._send(200, {"ok": True, "aiMode": agents.mode,"version":"4.0"})
+                return
+            if self.command=='GET' and path=='/api/auth':
+                self._send(200,{'user':auth.current(self.headers.get('Cookie')),'accounts':auth.accounts()});return
+            if self.command=='POST' and path in ('/api/auth/login','/api/auth/logout'):
+                self._origin();data=self._body()
+                if path.endswith('/login'):
+                    token=auth.login(data.get('email'),data.get('password'),self.client_address[0]);self._cookie(token)
+                    self._send(200,{'user':auth.current('hackalem_session='+token)})
+                else:
+                    auth.logout(self.headers.get('Cookie'));self._cookie('',True);self._send(200,{'ok':True})
                 return
             role, team_id = self._identity()
             if self.command == "GET" and path == "/api/bootstrap":
-                data = decorate(store.bootstrap(role, team_id),role,team_id)
-                data["meta"] = {"aiMode": agents.mode, "industries": INDUSTRIES, "skills":list(ALIASES), "version":"2.0"}
+                data = decorate(store.bootstrap(role, team_id,self.user["id"]),role,team_id)
+                data["meta"] = {"aiMode": agents.mode, "industries": INDUSTRIES, "skills":list(ALIASES), "version":"4.0"}
+                data['user']=self.user
                 self._send(200, data)
                 return
+            if self.command=='GET' and path=='/api/assistant':
+                self._send(200,store.assistant_history(self.user['id']));return
             if self.command not in ("POST", "PATCH"):
                 raise WorkflowError("Маршрут не найден.", 404, "not_found")
             self._origin()
             data = self._body()
+            if self.command=='POST' and path=='/api/assistant/clear':
+                store.clear_assistant(self.user['id']);self._send(200,store.assistant_history(self.user['id']));return
+            if self.command=='POST' and path=='/api/assistant':
+                message=text_value(data.get('message',''),'Сообщение',4000,required=False)
+                attachments=data.get('attachments',[])
+                if not message and not attachments:raise WorkflowError('Напишите сообщение или добавьте вложение.')
+                history=store.assistant_history(self.user['id'])
+                if data.get('revision')!=history['revision']:raise WorkflowError('Диалог изменился. Закройте и откройте помощника для обновления.',409)
+                context={'role':role,'page':text_value(data.get('page',''),'Страница',100,required=False)}
+                visible=decorate(store.bootstrap(role,team_id,self.user['id']),role,team_id)
+                viewed_team_id=data.get('teamId')
+                if viewed_team_id:
+                    viewed_team=next((t for t in visible['teams'] if t['id']==viewed_team_id),None)
+                    if not viewed_team:raise WorkflowError('Профиль не найден.',404)
+                    context['viewedProfile']={k:v for k,v in viewed_team.items() if k not in ('profilePreview',)}
+                context['catalog']=[{'id':t['id'],'title':t['fields']['title'],'industry':t['industry'],'skills':t.get('requiredSkills',[])} for t in visible['tasks'] if t['status']=='published'][:30]
+                tid=data.get('taskId')
+                if tid:
+                    task=next((t for t in visible['tasks'] if t['id']==tid),None)
+                    if not task:raise WorkflowError('Эта задача недоступна вашему аккаунту.',403)
+                    context['task']={'id':tid,'title':task['fields']['title'] or task.get('draft',''),'fields':task['fields'],'skills':task.get('requiredSkills',[]),'rating':task['score']['total']}
+                    if task.get('canEdit'):
+                        context['candidates']=[{'name':next(t['name'] for t in visible['teams'] if t['id']==c['teamId']),'score':c['score'],'reasons':c['reasons']} for c in task.get('candidates',[])[:5]]
+                if role=='student':
+                    context['profile']=store.get_team(team_id)
+                    context['profile'].pop('profilePreview',None)
+                    ranked=sorted([t for t in visible['tasks'] if t.get('match',{}).get('score') is not None],key=lambda t:-t['match']['score'])[:5]
+                    context['recommendations']=[dict(id=t['id'],title=t['fields']['title'],score=t['match']['score'],reason=' '.join(t['match']['reasons'])) for t in ranked]
+                result=assistant.respond(message,attachments,history['messages'],context)
+                self._send(200,store.save_assistant(self.user['id'],history['revision'],message,result['attachments'],result));return
+            summary_match=re.fullmatch(r'/api/teams/([A-Za-z0-9_-]+)/summary',path)
+            if self.command=='POST' and summary_match:
+                if role!='student' or summary_match[1]!=team_id:raise WorkflowError('Можно обновить только свой профиль.',403)
+                team=store.get_team(team_id)
+                result=profile_summary(team,getattr(agents,'provider',None))
+                self._send(200,{'team':store.save_summary(team_id,team.get('revision',1),result)});return
             if self.command == "POST" and path == "/api/tasks":
                 self._require(role, "business")
-                self._send(201, {"task": store.create_task(data)})
+                self._send(201, {"task": store.create_task(data,self.user["id"])})
                 return
             if self.command=='POST' and path=='/api/demo/reset':
                 self._require(role,'business')
                 if data.get('confirmed') is not True: raise WorkflowError('Подтвердите сброс учебного примера.')
-                self._send(200,{'task':store.reset_demo()}); return
+                self._send(200,{'task':store.reset_demo(self.user["id"])}); return
             profile_match=re.fullmatch(r'/api/teams/([A-Za-z0-9_-]+)/profile(?:/(import))?',path)
             if profile_match:
                 self._require(role,'student')
@@ -155,10 +215,35 @@ def make_server(host="127.0.0.1", port=8000, db_path=None, orchestrator=None):
                 elif action is None and self.command=='PATCH': saved=store.update_profile(team_id,data)
                 else: raise WorkflowError('Маршрут не найден.',404)
                 self._send(200,{'team':saved}); return
+            flow=re.fullmatch(r'/api/tasks/([A-Za-z0-9_-]+)/(brief-extract|brief-assess|company-research|brief-finish|qualification-answers)',path)
+            if flow and self.command=='POST':
+                self._require(role,'business')
+                task_id,action=flow.groups();task=store.assert_owner(task_id,self.user['id'])
+                if action=='company-research':
+                    saved,run_id=store.start_research(task_id)
+                    if run_id:
+                        def research_job():
+                            try:result=company.research(task['draft'])
+                            except Exception:result={'status':'unavailable','sources':[],'summary':'','mode':'local','warning':'Поиск недоступен. Используется описание бизнеса.'}
+                            store.finish_research(task_id,run_id,result)
+                        threading.Thread(target=research_job,daemon=True).start()
+                else:
+                    store._revision(task,data.get('revision'))
+                    if action=='brief-extract':
+                        if any(task['fields'].values()):raise WorkflowError('Поля уже заполнены; отредактируйте их вручную.',409)
+                        saved=store.save_brief(task_id,task['revision'],'briefExtraction',brief.extract(task['draft']))
+                    elif action=='brief-assess':saved=store.save_brief(task_id,task['revision'],'briefAssessment',brief.assess(task))
+                    elif action=='brief-finish':
+                        store.require_brief_finished(task,data.get('confirmed'))
+                        saved=store.save_qualification(task_id,task['revision'],company.questions(task),snapshot(task))
+                    else:
+                        answers=store.qualification_answers(task,data)
+                        saved=store.save_recommendations(task_id,task['revision'],data.get('questionSetId'),answers,company.recommend(task,answers))
+                self._send(200,{'task':saved});return
             extra=re.fullmatch(r'/api/tasks/([A-Za-z0-9_-]+)/(chat|chat-compose|skills-suggest|skills|review|review-resolve)',path)
             if extra and self.command=='POST':
                 self._require(role,'business')
-                task_id,action=extra.groups(); task=store.get_task(task_id)
+                task_id,action=extra.groups(); task=store.assert_owner(task_id,self.user["id"])
                 store._revision(task,data.get('revision'))
                 if action=='chat':
                     if task['status']!='draft': raise WorkflowError('Переписка доступна для черновиков.',409)
@@ -167,10 +252,8 @@ def make_server(host="127.0.0.1", port=8000, db_path=None, orchestrator=None):
                     if not message and history: raise WorkflowError('Введите сообщение.')
                     if len(history)>=200 or sum(len(x['content']) for x in history)+len(message)>100000:
                         raise WorkflowError('Достигнут лимит диалога. История сохранена; сформируйте и отредактируйте карточку.')
-                    focus=data.get('focus')
-                    if focus and focus not in FIELD_LABELS: raise WorkflowError('Неизвестное поле.')
                     turn_id='u-'+uuid.uuid4().hex
-                    response=intelligence.respond(task,message,turn_id,focus)
+                    response=intelligence.respond(task,message,turn_id)
                     saved=store.save_chat(task_id,task['revision'],message,turn_id,response)
                 elif action=='chat-compose':
                     saved=store.compose_chat(task_id,task['revision'])
@@ -186,6 +269,8 @@ def make_server(host="127.0.0.1", port=8000, db_path=None, orchestrator=None):
             match = re.fullmatch(r"/api/tasks/([A-Za-z0-9_-]+)(?:/(questions|compose|publish|proposals))?", path)
             if match:
                 task_id, action = match.groups()
+                if action!="proposals":
+                    self._require(role,"business");store.assert_owner(task_id,self.user["id"])
                 if self.command == "PATCH" and action is None:
                     self._require(role, "business")
                     result = {"task": store.update_task(task_id, data)}
@@ -218,6 +303,8 @@ def make_server(host="127.0.0.1", port=8000, db_path=None, orchestrator=None):
             match = re.fullmatch(r"/api/proposals/([A-Za-z0-9_-]+)/(decision|submit-stage|confirm-stage)", path)
             if match and self.command == "POST":
                 proposal_id, action = match.groups()
+                if action!="submit-stage":
+                    self._require(role,"business");store.assert_owner(store.proposal_task(proposal_id),self.user["id"])
                 if action == "decision":
                     self._require(role, "business")
                     result = {"proposal": store.decide(proposal_id, data)}
