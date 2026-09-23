@@ -92,27 +92,13 @@ def make_server(host="127.0.0.1", port=8000, db_path=None, orchestrator=None):
                 raise WorkflowError("Это действие доступно только в роли «%s»." % ("Бизнес" if expected == "business" else "Команда"), 403, "forbidden")
 
         def _origin(self):
-            expected_origin = (
-                os.environ.get("PUBLIC_ORIGIN")
-                or os.environ.get("RENDER_EXTERNAL_URL")
-                or "http://" + self.headers.get("Host", "")
-            ).rstrip("/")
-
+            # Demo roles are deliberately selectable. Block cross-origin browser writes.
             origin = self.headers.get("Origin")
-
+            expected_origin = os.environ.get("PUBLIC_ORIGIN", "http://" + self.headers.get("Host", "")).rstrip("/")
             if origin and origin != expected_origin:
-                raise WorkflowError(
-                    "Запрос с другого сайта запрещён.",
-                    403,
-                    "origin",
-                )
-
+                raise WorkflowError("Запрос с другого сайта запрещён.", 403, "origin")
             if self.headers.get("Sec-Fetch-Site") == "cross-site":
-                raise WorkflowError(
-                    "Запрос с другого сайта запрещён.",
-                    403,
-                    "origin",
-                )
+                raise WorkflowError("Запрос с другого сайта запрещён.", 403, "origin")
 
         def _dispatch(self):
             path = urlsplit(self.path).path
@@ -220,45 +206,21 @@ def make_server(host="127.0.0.1", port=8000, db_path=None, orchestrator=None):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="HackAlem MVP")
-
-    parser.add_argument(
-        "--host",
-        default=os.environ.get("HOST", "127.0.0.1"),
-    )
-    parser.add_argument(
-        "--port",
-        type=int,
-        default=int(os.environ.get("PORT", "8000")),
-    )
-    parser.add_argument(
-        "--db",
-        type=Path,
-        default=Path(
-            os.environ.get(
-                "DATABASE_PATH",
-                str(ROOT / "data" / "hackalem.sqlite3"),
-            )
-        ),
-    )
-
+    parser = argparse.ArgumentParser(description="HackAlem — локальный MVP")
+    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--db", type=Path, default=ROOT / "data" / "hackalem.sqlite3")
+    parser.add_argument("--public-origin", help="Exact public HTTPS URL of the tunnel")
     args = parser.parse_args()
-
+    if args.public_origin:
+        parsed = urlsplit(args.public_origin)
+        if parsed.scheme != "https" or not parsed.netloc or parsed.path not in ("", "/") or parsed.query or parsed.fragment:
+            parser.error("--public-origin must be an HTTPS origin without a path")
+        os.environ["PUBLIC_ORIGIN"] = args.public_origin.rstrip("/")
     try:
-        server = make_server(
-            host=args.host,
-            port=args.port,
-            db_path=args.db,
-        )
+        server = make_server(port=args.port, db_path=args.db)
     except OSError as exc:
-        parser.exit(1, "Не удалось запустить сервер: %s\n" % exc)
-
-    print(
-        "HackAlem запущен: %s:%s"
-        % (args.host, server.server_port),
-        flush=True,
-    )
-
+        parser.exit(1, "Не удалось запустить сервер: %s. Попробуйте --port 8001.\n" % exc)
+    print("HackAlem: http://127.0.0.1:%s\nДля остановки нажмите Ctrl+C." % server.server_port, flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
