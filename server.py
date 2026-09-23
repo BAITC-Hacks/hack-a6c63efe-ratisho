@@ -7,6 +7,7 @@ import os
 import re
 import sqlite3
 import sys
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
@@ -31,13 +32,18 @@ def load_environment():
 
 load_environment()
 from app.agents import AgentOrchestrator
-from app.domain import INDUSTRIES
+from app.domain import INDUSTRIES, FIELD_LABELS
+from app.intelligence import ConversationAgent
+from app.matching import decorate, ALIASES
+from app.profiles import preview as import_profile
+from app.store import text_value
 from app.store import Store, WorkflowError
 
 
 def make_server(host="127.0.0.1", port=8000, db_path=None, orchestrator=None):
     store = Store(db_path or ROOT / "data" / "hackalem.sqlite3")
     agents = orchestrator or AgentOrchestrator()
+    intelligence = ConversationAgent(getattr(agents,"provider",None))
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "HackAlem/1.0"
@@ -94,8 +100,10 @@ def make_server(host="127.0.0.1", port=8000, db_path=None, orchestrator=None):
         def _origin(self):
             # Demo roles are deliberately selectable. Block cross-origin browser writes.
             origin = self.headers.get("Origin")
-            expected_origin = os.environ.get("PUBLIC_ORIGIN", "http://" + self.headers.get("Host", "")).rstrip("/")
-            if origin and origin != expected_origin:
+            expected = (os.environ.get('PUBLIC_ORIGIN') or os.environ.get('RENDER_EXTERNAL_URL') or
+                        ('https://'+os.environ['RAILWAY_PUBLIC_DOMAIN'] if os.environ.get('RAILWAY_PUBLIC_DOMAIN') else None) or
+                        "http://"+self.headers.get("Host", "")).rstrip('/')
+            if origin and origin != expected:
                 raise WorkflowError("Запрос с другого сайта запрещён.", 403, "origin")
             if self.headers.get("Sec-Fetch-Site") == "cross-site":
                 raise WorkflowError("Запрос с другого сайта запрещён.", 403, "origin")
@@ -119,8 +127,8 @@ def make_server(host="127.0.0.1", port=8000, db_path=None, orchestrator=None):
                 return
             role, team_id = self._identity()
             if self.command == "GET" and path == "/api/bootstrap":
-                data = store.bootstrap(role, team_id)
-                data["meta"] = {"aiMode": agents.mode, "industries": INDUSTRIES}
+                data = decorate(store.bootstrap(role, team_id),role,team_id)
+                data["meta"] = {"aiMode": agents.mode, "industries": INDUSTRIES, "skills":list(ALIASES), "version":"2.0"}
                 self._send(200, data)
                 return
             if self.command not in ("POST", "PATCH"):
@@ -131,6 +139,50 @@ def make_server(host="127.0.0.1", port=8000, db_path=None, orchestrator=None):
                 self._require(role, "business")
                 self._send(201, {"task": store.create_task(data)})
                 return
+            if self.command=='POST' and path=='/api/demo/reset':
+                self._require(role,'business')
+                if data.get('confirmed') is not True: raise WorkflowError('Подтвердите сброс учебного примера.')
+                self._send(200,{'task':store.reset_demo()}); return
+            profile_match=re.fullmatch(r'/api/teams/([A-Za-z0-9_-]+)/profile(?:/(import))?',path)
+            if profile_match:
+                self._require(role,'student')
+                target,action=profile_match.groups()
+                if target!=team_id: raise WorkflowError('Можно менять только выбранный профиль.',403)
+                if action=='import' and self.command=='POST':
+                    team=store.get_team(team_id)
+                    result=import_profile(data,getattr(agents,'provider',None))
+                    saved=store.profile_preview(team_id,result,team.get('revision',1))
+                elif action is None and self.command=='PATCH': saved=store.update_profile(team_id,data)
+                else: raise WorkflowError('Маршрут не найден.',404)
+                self._send(200,{'team':saved}); return
+            extra=re.fullmatch(r'/api/tasks/([A-Za-z0-9_-]+)/(chat|chat-compose|skills-suggest|skills|review|review-resolve)',path)
+            if extra and self.command=='POST':
+                self._require(role,'business')
+                task_id,action=extra.groups(); task=store.get_task(task_id)
+                store._revision(task,data.get('revision'))
+                if action=='chat':
+                    if task['status']!='draft': raise WorkflowError('Переписка доступна для черновиков.',409)
+                    message=text_value(data.get('message',''),'Сообщение',4000,required=False)
+                    history=task.get('conversation',[])
+                    if not message and history: raise WorkflowError('Введите сообщение.')
+                    if len(history)>=200 or sum(len(x['content']) for x in history)+len(message)>100000:
+                        raise WorkflowError('Достигнут лимит диалога. История сохранена; сформируйте и отредактируйте карточку.')
+                    focus=data.get('focus')
+                    if focus and focus not in FIELD_LABELS: raise WorkflowError('Неизвестное поле.')
+                    turn_id='u-'+uuid.uuid4().hex
+                    response=intelligence.respond(task,message,turn_id,focus)
+                    saved=store.save_chat(task_id,task['revision'],message,turn_id,response)
+                elif action=='chat-compose':
+                    saved=store.compose_chat(task_id,task['revision'])
+                    composed_trace=saved['ai']['trace']
+                    suggestions=intelligence.suggest_skills(saved)
+                    suggestions['trace']=composed_trace+suggestions['trace']
+                    saved=store.save_insight(task_id,saved['revision'],'skillSuggestions',suggestions)
+                elif action=='skills-suggest': saved=store.save_insight(task_id,task['revision'],'skillSuggestions',intelligence.suggest_skills(task))
+                elif action=='skills': saved=store.confirm_skills(task_id,data)
+                elif action=='review': saved=store.save_insight(task_id,task['revision'],'review',intelligence.review(task))
+                else: saved=store.resolve_review(task_id,data)
+                self._send(200,{'task':saved,'ai':saved.get('ai',{})}); return
             match = re.fullmatch(r"/api/tasks/([A-Za-z0-9_-]+)(?:/(questions|compose|publish|proposals))?", path)
             if match:
                 task_id, action = match.groups()
@@ -207,17 +259,18 @@ def make_server(host="127.0.0.1", port=8000, db_path=None, orchestrator=None):
 
 def main():
     parser = argparse.ArgumentParser(description="HackAlem — локальный MVP")
-    parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--db", type=Path, default=ROOT / "data" / "hackalem.sqlite3")
-    parser.add_argument("--public-origin", help="Exact public HTTPS URL of the tunnel")
+    parser.add_argument("--port", type=int, default=int(os.environ.get("PORT","8000")))
+    parser.add_argument("--db", type=Path, default=Path(os.environ.get("DATABASE_PATH",str(ROOT / "data" / "hackalem.sqlite3"))))
+    parser.add_argument('--host',default=os.environ.get('HOST','127.0.0.1'))
+    parser.add_argument('--public-origin',help='Public HTTPS URL for a tunnel')
     args = parser.parse_args()
     if args.public_origin:
-        parsed = urlsplit(args.public_origin)
-        if parsed.scheme != "https" or not parsed.netloc or parsed.path not in ("", "/") or parsed.query or parsed.fragment:
-            parser.error("--public-origin must be an HTTPS origin without a path")
-        os.environ["PUBLIC_ORIGIN"] = args.public_origin.rstrip("/")
+        url=urlsplit(args.public_origin)
+        if url.scheme!='https' or not url.hostname or url.path not in ('','/') or url.query or url.fragment or url.username:
+            parser.error('--public-origin: укажите HTTPS-адрес без пути, скобок и Markdown.')
+        os.environ['PUBLIC_ORIGIN']=args.public_origin.rstrip('/')
     try:
-        server = make_server(port=args.port, db_path=args.db)
+        server = make_server(host=args.host, port=args.port, db_path=args.db)
     except OSError as exc:
         parser.exit(1, "Не удалось запустить сервер: %s. Попробуйте --port 8001.\n" % exc)
     print("HackAlem: http://127.0.0.1:%s\nДля остановки нажмите Ctrl+C." % server.server_port, flush=True)
