@@ -484,9 +484,53 @@ app.addEventListener('submit',event=>{
  run(event.submitter,async()=>{const result=await api('/api/auth/login','POST',values);state.user=result.user;state.role=result.user.role;state.teamId=result.user.teamId;state.filters=freshFilters();await refresh();go(state.role==='business'?'business':'catalog');render();});
 },true);
 async function loadAuth(){const data=await api('/api/auth');state.accounts=data.accounts;state.user=data.user;state.error=null;if(state.user){state.role=state.user.role;state.teamId=state.user.teamId;await refresh();}}
-const assistantWidget=createAssistant({api,getState:()=>state});
+function applyCatalogCommand(message){
+ const text=message.toLocaleLowerCase('ru');
+ if(!/(покаж|найди|отфильтр|оставь|выведи|сброс|убери.*фильтр)/.test(text))return null;
+ const f=freshFilters();let applied=[];
+ if(/сброс|убери.*фильтр/.test(text)){state.filters=f;go('catalog');render();return 'Фильтры сброшены. Показаны все опубликованные задачи.';}
+ const amount=text.match(/(?:от|выше|более|минимум|не менее)\s*(\d{1,3})|\b(\d{1,3})\s*\+/);
+ if(amount&&/готовност|рейтинг|совместим|соответств|совпад/.test(text)){
+  let n=Number(amount[1]||amount[2]);if(n>100)return 'Процент должен быть от 0 до 100.';
+  if(/выше|более/.test(text)&&!/не менее/.test(text))n+=1;
+  const key=/совместим|соответств|совпад/.test(text)?'minMatch':'minScore';f[key]=n;applied.push(`${key==='minScore'?'Готовность':'Совместимость'} от ${n}%`);
+ }
+ const skills=[...new Set(state.tasks.flatMap(t=>(t.requiredSkills||[]).filter(s=>s.confirmed).map(s=>s.name)))];
+ f.skills=skills.filter(s=>text.includes(s.toLocaleLowerCase('ru')));if(f.skills.length)applied.push('Навыки: '+f.skills.join(', '));
+ if(/удал[её]н/.test(text)){f.modes=['remote'];applied.push('Удалённая работа');}
+ if(/сначала новые|последние|новейш/.test(text)){f.sort='newest';applied.push('Сначала новые');}
+ if(!applied.length)return null;
+ state.filters=f;const count=filterTasks(state.tasks,f).length;go('catalog');render();
+ return `Фильтры применены: ${applied.join('; ')}. Найдено задач: ${count}. Условия видны в каталоге; их можно изменить или сбросить.`;
+}
+const assistantWidget=createAssistant({api,getState:()=>state,applyCatalogCommand});
 const briefWorkflow=createBriefWorkflow({state,app,api,esc,icon,safeUrl,render,run,toast,getTask,upsertTask,refresh,go,route,stored,remember,sectionHeading,ownTask,missingPage,deniedPage});
 createPage=briefWorkflow.createPage;
 editPage=briefWorkflow.editPage;
+
+const talentOriginalProfile=profilePage;
+profilePage=function(id){
+ const team=getTeam(id||state.teamId), a=team?.specialistAnalysis;
+ return talentOriginalProfile(id)+(a?`<section class="panel innovation-panel"><p class="eyebrow">АГЕНТ 3 · ДЕМО-АНАЛИЗ</p><h2>Карта компетенций</h2>${tags(a.directions)}<p>${esc(a.note)}</p><div class="task-grid">${a.skills.map(s=>`<article class="soft-card"><strong>${esc(s.name)}</strong><p>${s.confirmed?'✓ Есть источник':'Указан участником'}</p><small>Уровень: ${esc(s.level)}</small>${s.evidence.map(e=>`<p class="field-help">${esc(e.source)}: «${esc(e.quote)}» ${e.url?`<a href="${safeUrl(e.url)}" target="_blank" rel="noopener noreferrer">Источник</a>`:''}</p>`).join('')}</article>`).join('')}</div><p class="field-help">Уверенность: ${esc(a.confidence)}. Исправления — в существующей форме профиля.</p></section>`:'');
+};
+const talentOriginalTask=taskDetail;
+taskDetail=function(task){
+ const a=task?.taskAnalysis;
+ return talentOriginalTask(task)+(a?`<section class="panel innovation-panel"><p class="eyebrow">АГЕНТ 4 · ДЕМО-АНАЛИЗ</p><h2>Что потребуется для решения</h2><span class="pill soft">Сложность: ${esc(a.complexity)}</span><p>${esc(a.explanation)}</p>${tags(a.directions)}<div class="task-grid"><div><h3>Навыки и технологии</h3>${tags(a.requiredSkills)}<p>Роли: ${esc(a.suggestedRoles.join(', '))}</p><p>Команда: ${esc(a.teamSize)}</p></div><div><h3>Условия</h3><p>Срок: ${esc(a.duration)}</p><p>Интеграции: ${esc(a.integrations.join(', ')||'Не подтверждены')}</p><p>Данные: ${esc(a.data)}</p></div></div><details><summary>Что ещё нужно уточнить · уверенность ${esc(a.confidence)}</summary><p>${esc(a.missing.join(', '))}</p><p>${esc(a.security)}</p><p>${esc(a.agent2Status)}</p></details></section>`:'');
+};
+const talentOriginalMatch=matchPanel;
+matchPanel=function(m){const a=m?.recommendation;return talentOriginalMatch(m)+(a?`<div class="match-panel"><p class="eyebrow">АГЕНТ 5 · ПЕРСОНАЛЬНЫЙ ПОДБОР</p><h3>${esc(a.group)}</h3><p>Возможная роль: ${esc(a.role)}</p><p>Совпавшие навыки с источниками: ${esc(a.confirmedSkills.join(', ')||'Пока нет подтверждений')}</p><p>${esc(a.complexityFit)}</p><p>${esc(a.availabilityFit)}</p><small>${esc(a.note)}</small></div>`:'');};
+const talentOriginalResults=catalogResults;
+catalogResults=function(){
+ const html=talentOriginalResults();
+ if(state.role!=='student'||state.filters.sort!=='relevance')return html;
+ const tasks=filteredTasks(), groups=['Наиболее подходящие','Хорошо подходящие','Для развития','Менее подходящие'];
+ const start=html.indexOf('<div class="task-grid');
+ if(start<0)return html;
+ return html.slice(0,start)+groups.map(g=>{const list=tasks.filter(t=>t.match?.recommendation?.group===g);return `<section><h2>${g} <span class="count-badge">${list.length}</span></h2>${list.length?`<div class="task-grid discovery-grid">${list.map(taskCard).join('')}</div>`:'<p class="field-help">Пока нет задач в этой группе.</p>'}</section>`;}).join('');
+};
+const talentOriginalCatalog=catalogPage;
+catalogPage=function(){return (state.role==='student'?`<section class="panel innovation-panel"><p class="eyebrow">АГЕНТЫ 3 → 5 ← 4</p><h2>Задачи под ваши навыки</h2><p>Профиль специалиста + анализ задачи → персональная лента с объяснениями. Демо использует прозрачные правила.</p><button class="btn btn-primary" id="talent-feed">Показать мою ленту</button><p class="field-help">Низкое совпадение не мешает открыть задачу и откликнуться.</p></section>`:'')+talentOriginalCatalog();};
+app.addEventListener('click',e=>{if(e.target.closest('#talent-feed')){state.filters.sort='relevance';render();}});
 
 try { await loadAuth(); render(); } catch(error) { state.error = error.message; render(); }
