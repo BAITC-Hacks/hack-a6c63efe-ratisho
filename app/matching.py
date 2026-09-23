@@ -65,7 +65,7 @@ def decorate(data, role, team_id):
     team = next((x for x in data['teams'] if x['id'] == team_id), data['teams'][0])
     for task in data['tasks']:
         task['match'] = match(task, team)
-        if role == 'business':
+        if role == 'business' and task.get('canEdit',True):
             task['candidates'] = sorted([{'teamId':t['id'], **match(task,t)} for t in data['teams']],
                                         key=lambda x: (-(x['score'] if x['score'] is not None else -1), x['teamId']))
         else:

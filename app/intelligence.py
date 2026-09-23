@@ -36,14 +36,9 @@ class ConversationAgent:
         sources = {'draft': task['draft']}
         sources.update({t['id']: t['content'] for t in history if t['role']=='user'})
         sources[turn_id] = message
-        focus = focus or next((t.get('focus') for t in reversed(history) if t['role']=='assistant'), 'need')
-        updates = []
-        # Offline mode requires explicit field targeting, never guesses facts from prose.
-        uncertain = '?' in message or not field_is_meaningful(message) or message.strip().casefold() in ('не знаю','пока не знаю','да','ок','нет')
-        if message and focus in FIELD_LABELS and not uncertain:
-            value = message[:FIELD_MAX_LENGTHS[focus]]
-            updates = [{'field':focus,'value':value,'source':turn_id}]
-            memory[focus] = updates[0]
+        context = ContextAgent().route(task,message or (task['draft'] if not history else ''),turn_id if message else 'draft',focus)
+        focus,updates,uncertain=context['focus'],context['updates'],context['uncertain']
+        for update in updates: memory[update['field']]=update
         missing = [f for f in QUESTION_ORDER if not field_is_meaningful(memory.get(f,{}).get('value',task['fields'].get(f,'')))]
         next_focus = focus if message and uncertain else (missing[0] if missing else 'success')
         if not history:
@@ -53,14 +48,14 @@ class ConversationAgent:
         elif uncertain:
             reply = 'Можно оставить это неизвестным и перейти к другому пункту. Если есть пример из практики, расскажите о нём.\n\n' + QUESTION_TEMPLATES[next_focus]
         else:
-            reply = 'Сохранил ваш ответ в памяти черновика. В локальном режиме вы можете выбрать, к какому полю относится следующий ответ.\n\n' + (QUESTION_TEMPLATES[next_focus] if missing else 'Основные сведения собраны. Можно сформировать карточку или уточнить любой пункт.')
+            reply = 'Сохранил сведения из вашего ответа. Тему определяю по содержанию и предыдущему вопросу.\n\n' + (QUESTION_TEMPLATES[next_focus] if missing else 'Основные сведения собраны. Можно сформировать карточку или уточнить любой пункт.')
         mode, warning = 'local', LOCAL_WARNING
         if self.provider:
             try:
                 raw = self.provider.generate(CHAT_PROMPT, {'draft':task['draft'],'industry':task['industry'],
                     'fields':task['fields'],'memory':task.get('memory',{}),'conversation':history,
                     'new_turn':{'id':turn_id,'role':'user','content':message},'sources':sources,
-                    'allowed_fields':list(FIELD_LABELS),'field_limits':FIELD_MAX_LENGTHS,'requested_focus':focus})
+                    'allowed_fields':list(FIELD_LABELS),'field_limits':FIELD_MAX_LENGTHS,'context_routing':context})
                 if not isinstance(raw.get('reply'),str) or not 1 <= len(raw['reply']) <= 4000 or raw.get('focus') not in FIELD_LABELS:
                     raise ValueError('Invalid reply')
                 if not history and raw['reply'].count('?') < 3: raise ValueError('Need three opening questions')
@@ -76,7 +71,7 @@ class ConversationAgent:
                 mode, warning = 'remote',''
             except (ValueError,TypeError,KeyError,OSError,RecursionError):
                 warning = 'Модель не ответила или ответ не прошёл проверку. ' + LOCAL_WARNING
-        trace = [_trace('memory','Загружено %s сообщений и %s фактов.'%(len(history),len(task.get('memory',{})))),
+        trace = [_trace('context','Определена тема ответа: '+FIELD_LABELS.get(focus,focus)), _trace('memory','Загружено %s сообщений и %s фактов.'%(len(history),len(task.get('memory',{})))),
                  _trace('interview','Ответ модели с учётом истории.' if mode=='remote' else 'Диалог по локальным правилам.', 'done' if mode=='remote' else 'fallback'),
                  _trace('validation','Проверены источники %s обновлений; поля не подтверждены автоматически.'%len(updates))]
         return {'reply':reply,'focus':next_focus,'updates':updates,'mode':mode,'warning':warning,'trace':trace}
@@ -130,3 +125,43 @@ class ConversationAgent:
             except (ValueError,KeyError,TypeError,OSError): warning='Модель недоступна; показана локальная проверка.'
         return {'issues':[{**i,'id':'issue-%s'%n,'status':'open'} for n,i in enumerate(issues)],'mode':mode,'warning':warning,
                 'trace':[_trace('review','Найдено %s вопросов для проверки.'%len(issues))]}
+
+
+class ContextAgent:
+    """Routes explicit facts to multiple fields; unresolved answers stay unfilled."""
+    PATTERNS = [
+      ('success',r'критери|приёмк|приемк|успех|считаем успеш|точност|без потерь|контрольн'),
+      ('contact',r'контакт|связаться|@|телефон|почта'),
+      ('interaction',r'консультац|встреч|созвон|общать|раз в неделю'),
+      ('constraints',r'срок|дней|недел|бюджет|ограничен|до [0-9]|за [0-9]|без интеграци'),
+      ('data',r'данны|csv|xlsx|таблиц|строк|запис|выгрузк'),
+      ('users',r'пользоват|пользовать|для управляющ|для диспетчер|для методист|сотрудники|клиентами будут'),
+      ('outcome',r'результат|прототип|дашборд|веб-экран|передать|на выходе'),
+      ('need',r'проблем|нужно|нужен|хотим|уменьш|снизить|улучш'),
+      ('context',r'контекст|занимаемся|сейчас|у нас|бизнес'),
+      ('title',r'^название\s*:'),
+    ]
+    def route(self,task,message,turn_id,explicit=None):
+        history=task.get('conversation',[])
+        previous=next((t.get('focus') for t in reversed(history) if t['role']=='assistant'),'need')
+        uncertain=not field_is_meaningful(message) or message.strip().casefold() in ('не знаю','пока не знаю','да','ок','нет')
+        updates=[]
+        if not uncertain:
+            for clause in re.split(r'(?<=[.!?;])\s+|\n+',message):
+                if '?' in clause or re.search(r'не знаю|не уверен|пока неизвест',clause,re.I):continue
+                fields=[k for k,pattern in self.PATTERNS if re.search(pattern,clause,re.I)]
+                if 'data' in fields and 'constraints' in fields and not re.search(r'срок|бюджет|ограничен|дедлайн|успеть',clause,re.I):fields.remove('constraints')
+                # A sentence can mention tools and time. Keep verbatim evidence for each.
+                if explicit:fields=[explicit]
+                elif not fields and len(re.split(r'(?<=[.!?;])\s+|\n+',message))==1:fields=[previous]
+                for field in fields[:3]:
+                    if field not in FIELD_LABELS:continue
+                    value=clause[:FIELD_MAX_LENGTHS[field]]
+                    existing=next((x for x in updates if x['field']==field),None)
+                    if existing:
+                        # Preserve an exact substring spanning both clauses.
+                        begin=message.find(existing['value']);end=message.find(clause,begin)+len(clause)
+                        existing['value']=message[begin:end][:FIELD_MAX_LENGTHS[field]]
+                    else:updates.append(dict(field=field,value=value,source=turn_id))
+        focus=updates[0]['field'] if updates else (explicit or previous)
+        return dict(focus=focus,updates=updates[:10],uncertain=uncertain or (bool(message) and not updates))

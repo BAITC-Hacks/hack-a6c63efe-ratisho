@@ -54,6 +54,9 @@ class Store:
                 for proposal in data["proposals"]:
                     self._save_proposal(db, proposal)
                 db.execute("INSERT INTO metadata VALUES ('initialized', '1')")
+            from .demo import migrate
+            migrate(self,db)
+            db.execute('CREATE TABLE IF NOT EXISTS assistant_history (user_id TEXT PRIMARY KEY,payload TEXT NOT NULL,revision INTEGER NOT NULL)')
 
     @contextmanager
     def connection(self, write=False):
@@ -78,6 +81,7 @@ class Store:
         clean.pop("score", None)
         clean.pop("match", None)
         clean.pop("candidates", None)
+        clean.pop("canEdit",None)
         db.execute("INSERT INTO tasks VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload",
                    (clean["id"], self._dump(clean)))
 
@@ -115,12 +119,16 @@ class Store:
             team["points"] = points[team["id"]]
         return teams
 
-    def bootstrap(self, role, team_id):
+    def bootstrap(self, role, team_id, owner_id=None):
         with self.connection() as db:
             tasks = []
             for row in db.execute("SELECT id FROM tasks"):
                 task = self._task(db, row[0])
-                if role == "business" or task["status"] == "published":
+                if (role == "business" and (owner_id is None or task.get("ownerBusinessId")==owner_id)) or task["status"] == "published":
+                    task['canEdit']=role=='business' and (owner_id is None or task.get('ownerBusinessId')==owner_id)
+                    if not task['canEdit']:
+                        for key in ('conversation','memory','ai','review','skillSuggestions','answers','questions','draft','scoreHistory','briefExtraction','briefAssessment','briefFinished','companyResearch','qualification'):
+                            task.pop(key,None)
                     tasks.append(task)
             tasks.sort(key=lambda t: (-t["score"]["total"], t["id"]))
             query = "SELECT payload FROM proposals"
@@ -129,6 +137,9 @@ class Store:
                 query += " WHERE team_id=?"
                 args = (team_id,)
             proposals = [json.loads(row[0]) for row in db.execute(query, args)]
+            if role=='business' and owner_id is not None:
+                owned={t['id'] for t in tasks if t['canEdit']}
+                proposals=[p for p in proposals if p['taskId'] in owned]
             proposals.sort(key=lambda p: (p["createdAt"], p["id"]), reverse=True)
             teams=self._teams(db)
             for team in teams:
@@ -160,13 +171,13 @@ class Store:
         task["updatedAt"] = now()
         task["score"] = score_task(task["fields"], task["confirmedFields"])
 
-    def create_task(self, payload):
+    def create_task(self, payload, owner_id="b1"):
         draft = text_value(payload.get("draft"), "Описание", 12000)
         industry = text_value(payload.get("industry"), "Тема", 120)
         stamp = now()
         task = {"id": "task-" + uuid.uuid4().hex, "draft": draft, "industry": industry,
                 "fields": {key: "" for key in FIELD_LABELS}, "confirmedFields": [], "status": "draft",
-                "revision": 1, "createdAt": stamp, "updatedAt": stamp, "questions": [], "answers": {}}
+                "ownerBusinessId":owner_id, "revision": 1, "createdAt": stamp, "updatedAt": stamp, "questions": [], "answers": {}}
         with self.connection(write=True) as db:
             self._save_task(db, task)
         task["score"] = score_task(task["fields"], [])
@@ -201,6 +212,12 @@ class Store:
             self._revision(task, payload.get("revision"))
             if task["status"] == "published" and not field_is_meaningful(fields["title"]):
                 raise WorkflowError("У опубликованной задачи должно быть название.")
+            if task['fields']!=fields or task['industry']!=industry:
+                for key in ('briefAssessment','briefFinished','qualification'):
+                    task.pop(key,None)
+                if task.get('workflowVersion')==4:
+                    task['requirementsConfirmed']=False
+                    for skill in task.get('requiredSkills',[]):skill['confirmed']=False
             task.update(fields=fields, confirmedFields=confirmed, industry=industry)
             self._changed(task)
             self._save_task(db, task)
@@ -214,6 +231,8 @@ class Store:
             self._revision(task, payload.get("revision"))
             if not field_is_meaningful(task["fields"]["title"]):
                 raise WorkflowError("Добавьте название перед публикацией.")
+            if task.get('workflowVersion')==4 and (not task.get('qualification',{}).get('recommendations') or not task.get('requirementsConfirmed')):
+                raise WorkflowError('Завершите уточнения второго агента и согласуйте требования перед публикацией.',409)
             task["status"] = "published"
             self._changed(task)
             self._save_task(db, task)
@@ -322,7 +341,9 @@ class Store:
             weight=s.get('weight',1)
             if type(weight) is not int or weight not in (1,2,3): raise WorkflowError('Вес навыка: 1, 2 или 3.')
             if name.casefold() in seen: continue
-            seen.add(name.casefold()); result.append({'name':name,'weight':weight,'confirmed':True})
+            category=s.get('category','required')
+            if category not in ('required','optional'):raise WorkflowError('Некорректная категория навыка.')
+            seen.add(name.casefold()); result.append({'name':name,'weight':weight,'confirmed':True,'category':category})
         deadline=payload.get('deadline',''); work_mode=payload.get('workMode','flexible')
         if work_mode not in ('remote','onsite','hybrid','flexible'): raise WorkflowError('Некорректный формат работы.')
         if not isinstance(deadline,str): raise WorkflowError('Некорректная дата.')
@@ -331,7 +352,7 @@ class Store:
             except ValueError: raise WorkflowError('Дата в формате ГГГГ-ММ-ДД.')
         with self.connection(write=True) as db:
             task=self._task(db,task_id); self._revision(task,payload.get('revision'))
-            task.update(requiredSkills=result,deadline=deadline,workMode=work_mode)
+            task.update(requiredSkills=result,deadline=deadline,workMode=work_mode,requirementsConfirmed=True)
             self._changed(task); self._save_task(db,task); return task
 
     def resolve_review(self, task_id, payload):
@@ -366,6 +387,15 @@ class Store:
             team=json.loads(db.execute('SELECT payload FROM teams WHERE id=?',(team_id,)).fetchone()[0])
             if payload.get('revision')!=team.get('revision',1): raise WorkflowError('Профиль изменился. Обновите страницу.',409)
             team.update(name=name,skills=skills,technologies=technologies,interests=interests)
+            for key,limit in [('description',3000),('university',200),('education',200),('experience',2000),('availability',200)]:
+                if key in payload:team[key]=text_value(payload[key],key,limit,required=False)
+            if 'studentStatus' in payload:
+                if payload['studentStatus'] not in ('students','mixed','graduates','professionals'):raise WorkflowError('Выберите состав команды.')
+                team['studentStatus']=payload['studentStatus']
+            if 'memberCount' in payload:
+                if type(payload['memberCount']) is not int or not 1<=payload['memberCount']<=30:raise WorkflowError('Размер команды: от 1 до 30.')
+                team['memberCount']=payload['memberCount']
+            team.pop('aiSummary',None)
             if payload.get('acceptImport') is True:
                 draft=team.get('profilePreview')
                 if not draft: raise WorkflowError('Сначала импортируйте профиль.')
@@ -382,17 +412,124 @@ class Store:
             db.execute('UPDATE teams SET payload=? WHERE id=?',(self._dump(team),team_id))
             return team
 
-    def reset_demo(self):
+    def reset_demo(self, owner_id="b1"):
         # A reset affects only the explicitly marked practice task and its proposals.
         with self.connection(write=True) as db:
             old=[json.loads(row[0]) for row in db.execute('SELECT payload FROM tasks')]
             for task in old:
-                if task.get('practice') is True:
+                if task.get('practice') is True and task.get('ownerBusinessId','b1')==owner_id:
                     db.execute('DELETE FROM proposals WHERE task_id=?',(task['id'],))
                     db.execute('DELETE FROM tasks WHERE id=?',(task['id'],))
             stamp=now()
             task={'id':'practice-'+uuid.uuid4().hex,'draft':'У нас кофейня. Хотим уменьшить списания выпечки.',
                   'industry':'Общественное питание','fields':{k:'' for k in FIELD_LABELS},'confirmedFields':[],
-                  'status':'draft','revision':1,'createdAt':stamp,'updatedAt':stamp,'questions':[],'answers':{},'practice':True}
+                  'status':'draft','revision':1,'createdAt':stamp,'updatedAt':stamp,'questions':[],'answers':{},'practice':True,'ownerBusinessId':owner_id}
             self._save_task(db,task)
             return self._task(db,task['id'])
+
+    def assert_owner(self, task_id, owner_id):
+        task=self.get_task(task_id)
+        if task.get('ownerBusinessId','b1')!=owner_id:raise WorkflowError('Задача принадлежит другому аккаунту бизнеса.',403,'forbidden')
+        return task
+
+    def proposal_task(self, proposal_id):
+        with self.connection() as db:return self._proposal(db,proposal_id)['taskId']
+
+    def assistant_history(self,user_id):
+        with self.connection() as db:
+            row=db.execute('SELECT payload,revision FROM assistant_history WHERE user_id=?',(user_id,)).fetchone()
+            return {'messages':json.loads(row[0]),'revision':row[1]} if row else {'messages':[],'revision':0}
+
+    def save_assistant(self,user_id,revision,message,attachments,result):
+        with self.connection(write=True) as db:
+            row=db.execute('SELECT payload,revision FROM assistant_history WHERE user_id=?',(user_id,)).fetchone()
+            if (row[1] if row else 0)!=revision:raise WorkflowError('Диалог изменился в другой вкладке. Откройте помощника заново.',409)
+            messages=json.loads(row[0]) if row else []
+            messages += [{'role':'user','content':message,'attachments':attachments,'at':now()},
+                         {'role':'assistant','content':result['reply'],'mode':result['mode'],'warning':result.get('warning',''),'at':now()}]
+            characters=sum(len(m['content'])+sum(len(a.get('transcript','')) for a in m.get('attachments',[])) for m in messages)
+            if len(messages)>200 or characters>150000:raise WorkflowError('Диалог заполнен. Начните новый диалог в меню помощника.')
+            db.execute('INSERT INTO assistant_history VALUES (?,?,?) ON CONFLICT(user_id) DO UPDATE SET payload=excluded.payload,revision=excluded.revision',(user_id,self._dump(messages),revision+1))
+            return dict(messages=messages,revision=revision+1)
+
+    def clear_assistant(self,user_id):
+        with self.connection(write=True) as db:
+            db.execute("INSERT INTO assistant_history VALUES (?,'[]',1) ON CONFLICT(user_id) DO UPDATE SET payload='[]',revision=revision+1",(user_id,))
+
+    def save_summary(self,team_id,revision,summary):
+        with self.connection(write=True) as db:
+            row=db.execute('SELECT payload FROM teams WHERE id=?',(team_id,)).fetchone();team=json.loads(row[0])
+            if team.get('revision',1)!=revision:raise WorkflowError('Профиль изменился; обновите страницу.',409)
+            team['aiSummary']=summary
+            db.execute('UPDATE teams SET payload=? WHERE id=?',(self._dump(team),team_id))
+            return team
+
+    def save_brief(self,task_id,revision,key,result):
+        with self.connection(write=True) as db:
+            task=self._task(db,task_id);self._revision(task,revision)
+            task['workflowVersion']=4
+            if key=='briefExtraction':
+                if any(task['fields'].values()):raise WorkflowError('Поля уже заполнены. Извлечение не должно перезаписывать ваши правки.',409)
+                task['fields']=validate_fields(result['fields']);task['confirmedFields']=[]
+            if key=='briefAssessment' and result.get('fieldsSnapshot')!=task['fields']:raise WorkflowError('Поля изменились. Повторите оценку.',409)
+            task[key]=result
+            self._changed(task);self._save_task(db,task);return task
+
+    def start_research(self,task_id):
+        with self.connection(write=True) as db:
+            task=self._task(db,task_id);research=task.get('companyResearch',{})
+            if research.get('status')=='running':
+                started=datetime.fromisoformat(research['startedAt'])
+                if (datetime.now(timezone.utc)-started).total_seconds()<120:return task,None
+            elif research:return task,None
+            run_id=uuid.uuid4().hex
+            task['companyResearch']={'status':'running','runId':run_id,'startedAt':now(),'sources':[],'summary':''}
+            self._save_task(db,task);return task,run_id
+
+    def finish_research(self,task_id,run_id,result):
+        # Background research never increments the editing revision or replaces fields.
+        with self.connection(write=True) as db:
+            task=self._task(db,task_id)
+            if task.get('companyResearch',{}).get('runId')!=run_id:return task
+            task['companyResearch']={**result,'runId':run_id,'finishedAt':now()}
+            self._save_task(db,task);return task
+
+    @staticmethod
+    def require_brief_finished(task,confirmed):
+        if confirmed is not True:raise WorkflowError('Подтвердите, что закончили проверку десяти полей.')
+        if task.get('briefAssessment',{}).get('fieldsSnapshot')!=task['fields']:raise WorkflowError('Сначала сохраните и оцените десять полей.',409)
+        if task.get('companyResearch',{}).get('status')=='running':raise WorkflowError('Поиск компании ещё идёт. Дождитесь завершения и повторите.',409)
+
+    def save_qualification(self,task_id,revision,result,context_hash):
+        from .brief_workflow import snapshot
+        with self.connection(write=True) as db:
+            task=self._task(db,task_id);self._revision(task,revision)
+            self.require_brief_finished(task,True)
+            if snapshot(task)!=context_hash:raise WorkflowError('Контекст изменился. Повторите подготовку вопросов.',409)
+            if not 3<=len(result.get('questions',[]))<=5:raise WorkflowError(result.get('warning') or 'Не удалось подготовить безопасные вопросы. Повторите попытку.')
+            task['workflowVersion']=4;task['briefFinished']=dict(task['fields'])
+            task['qualification']={**result,'id':uuid.uuid4().hex,'contextHash':context_hash,'answers':{}}
+            task['requirementsConfirmed']=False
+            for skill in task.get('requiredSkills',[]):skill['confirmed']=False
+            self._changed(task);self._save_task(db,task);return task
+
+    @staticmethod
+    def qualification_answers(task,payload):
+        from .brief_workflow import snapshot
+        q=task.get('qualification',{})
+        if not q or q.get('id')!=payload.get('questionSetId') or q.get('contextHash')!=snapshot(task):raise WorkflowError('Вопросы устарели. Завершите проверку полей ещё раз.',409)
+        answers=payload.get('answers')
+        if not isinstance(answers,dict) or set(answers)!={r['id'] for r in q['questions']}:raise WorkflowError('Ответьте на каждый вопрос. Если информация неизвестна, так и напишите.')
+        clean={k:text_value(v,'Ответ',3000,required=False) for k,v in answers.items()}
+        if not all(clean.values()):raise WorkflowError('Заполните все ответы; можно написать «пока неизвестно».')
+        return clean
+
+    def save_recommendations(self,task_id,revision,question_set_id,answers,result):
+        with self.connection(write=True) as db:
+            task=self._task(db,task_id);self._revision(task,revision)
+            self.qualification_answers(task,{'questionSetId':question_set_id,'answers':answers})
+            task['qualification'].update(answers=answers,recommendations=result)
+            task['requirementsConfirmed']=False
+            task['skillSuggestions']={'mode':result['mode'],'warning':result['warning'],'skills':[dict(s,weight=3 if category=='required' else 1,category=category) for key,category in (('requiredSkills','required'),('optionalSkills','optional')) for s in result[key]],'trace':[]}
+            for skill in task.get('requiredSkills',[]):skill['confirmed']=False
+            self._changed(task);self._save_task(db,task);return task

@@ -294,11 +294,16 @@ class RemoteProvider:
         return value
 
     def _generate(self, instruction: str, payload: dict) -> dict:
+        payload=dict(payload)
+        images=payload.pop('_image_inputs',[])
+        content=json.dumps(payload, ensure_ascii=False)
+        if images:
+            content=[{'type':'text','text':content}]+[{'type':'image_url','image_url':{'url':url,'detail':'low'}} for url in images]
         body = json.dumps({
             "model": self.model,
             "messages": [
                 {"role": "system", "content": instruction},
-                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                {"role": "user", "content": content},
             ],
             "response_format": {"type": "json_object"},
             "max_completion_tokens": 6000,
