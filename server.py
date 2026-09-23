@@ -174,7 +174,7 @@ def make_server(host="127.0.0.1", port=8000, db_path=None, orchestrator=None):
                     viewed_team=next((t for t in visible['teams'] if t['id']==viewed_team_id),None)
                     if not viewed_team:raise WorkflowError('Профиль не найден.',404)
                     context['viewedProfile']={k:v for k,v in viewed_team.items() if k not in ('profilePreview',)}
-                context['catalog']=[{'id':t['id'],'title':t['fields']['title'],'industry':t['industry'],'skills':t.get('requiredSkills',[])} for t in visible['tasks'] if t['status']=='published'][:30]
+                context['catalog']=[{'id':t['id'],'title':t['fields']['title'],'industry':t['industry'],'readiness':t['score']['total'],'match':t.get('match',{}).get('score'),'analysis':t.get('taskAnalysis',{}),'skills':t.get('requiredSkills',[])} for t in visible['tasks'] if t['status']=='published'][:30]
                 tid=data.get('taskId')
                 if tid:
                     task=next((t for t in visible['tasks'] if t['id']==tid),None)
