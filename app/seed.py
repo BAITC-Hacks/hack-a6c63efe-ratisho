@@ -101,4 +101,12 @@ def seed_data():
         "idea": item[3], "plan": item[4], "timeline": item[5], "prototypeUrl": item[6],
         "status": "pending", "createdAt": CREATED_AT, "milestone": None,
     } for item in proposal_content]
+    skill_sets = [['Python','pandas','Power BI'], ['Python','FastAPI','SQL'], ['Python','Визуализация данных','Power BI'], ['JavaScript','Тестирование'], ['Excel','SQL']]
+    for task, names in zip(tasks[:5],skill_sets):
+        task['requiredSkills']=[{'name':n,'weight':2 if i==0 else 1,'confirmed':True} for i,n in enumerate(names)]
+        task['workMode']='remote' if task['id'] in ('task1','task3','task5') else 'hybrid'
+        task['deadline']='2026-10-15'
+        task['syntheticRequirements']=True
+    teams[0]['technologies'] += ['pandas','Power BI']
+    teams[3]['technologies'] += ['Power BI']
     return {"tasks": tasks, "teams": teams, "proposals": proposals}
