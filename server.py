@@ -205,15 +205,45 @@ def make_server(host="127.0.0.1", port=8000, db_path=None, orchestrator=None):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="HackAlem — локальный MVP")
-    parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--db", type=Path, default=ROOT / "data" / "hackalem.sqlite3")
+    parser = argparse.ArgumentParser(description="HackAlem MVP")
+
+    parser.add_argument(
+        "--host",
+        default=os.environ.get("HOST", "127.0.0.1"),
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=int(os.environ.get("PORT", "8000")),
+    )
+    parser.add_argument(
+        "--db",
+        type=Path,
+        default=Path(
+            os.environ.get(
+                "DATABASE_PATH",
+                str(ROOT / "data" / "hackalem.sqlite3"),
+            )
+        ),
+    )
+
     args = parser.parse_args()
+
     try:
-        server = make_server(port=args.port, db_path=args.db)
+        server = make_server(
+            host=args.host,
+            port=args.port,
+            db_path=args.db,
+        )
     except OSError as exc:
-        parser.exit(1, "Не удалось запустить сервер: %s. Попробуйте --port 8001.\n" % exc)
-    print("HackAlem: http://127.0.0.1:%s\nДля остановки нажмите Ctrl+C." % server.server_port, flush=True)
+        parser.exit(1, "Не удалось запустить сервер: %s\n" % exc)
+
+    print(
+        "HackAlem запущен: %s:%s"
+        % (args.host, server.server_port),
+        flush=True,
+    )
+
     try:
         server.serve_forever()
     except KeyboardInterrupt:
